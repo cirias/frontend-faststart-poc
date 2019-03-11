@@ -1,0 +1,232 @@
+<input id="file_input" type="file" onchange="parse()" />
+
+<script>
+  async function upload(filename, blob) {
+    await fetch('http://127.0.0.1:4000', {
+      method: 'POST',
+      body: blob,
+      headers: {
+        'x-filename': filename,
+      },
+    });
+  }
+
+  const HEAD_SIZE = 8;
+  const NESTED_BOX_TYPES = ['moov', 'trak', 'mdia', 'minf', 'stbl'];
+  const NESTED_BOX_TYPES_SET = new Set(NESTED_BOX_TYPES);
+
+  async function parse() {
+    const input = document.querySelector('#file_input');
+    const file = input.files[0];
+    if (!file) return;
+
+    console.log("file size:", file.size);
+    const root = await parseBox(file, 0, file.size, undefined);
+
+    const [ first, second ] = findBoxes(root, b => ['moov', 'mdat'].includes(b.type), false);
+    if (!first) {
+      throw new Error('could not find moov and mdat in file');
+    }
+
+    // enable faststart
+    if (first.type === 'mdat') {
+      const moov = second;
+
+      const coBoxes = findBoxes(moov, b => ['stco', 'co64'].includes(b.type), true);
+      for (const box of coBoxes) {
+        box.buffer = await calculateChunkOffsets(file, moov.size, box);
+      }
+
+      const [ moovPrev ] = findBoxes(root, b => b.next === moov);
+      moovPrev.next = moov.next; // delete moov
+
+      // insert moov at the beginning
+      const rootNext = root.next;
+      root.next = moov;
+      moov.next = rootNext;
+    }
+
+    dumpBox(root, '');
+    let partNumber = 0;
+    for (let start = { box: root, boxOffset: 0 }; !!start; ) {
+      const buffer = new Uint8Array(10 * 1024 * 1024);
+      const result = await readBytes(file, start, buffer);
+      console.log(result);
+      await upload(`faststart.${partNumber.toString().padStart(3, '0')}`, buffer.subarray(0, result.written));
+
+      partNumber++;
+      start = result.nextStart;
+    }
+
+    // const buffers = [];
+    // for (let start = { box: root, boxOffset: 0 }; !!start; ) {
+    //   const buffer = new Uint8Array(10 * 1024 * 1024);
+    //   const result = await readBytes(file, start, buffer);
+    //   console.log(result);
+    //   buffers.push(buffer.subarray(0, result.written));
+    //   start = result.nextStart;
+    // }
+
+    // var data = new Blob(buffers);
+    // const href = window.URL.createObjectURL(data);
+    // console.log(href);
+
+    // var link = document.createElement('a');
+    // link.setAttribute('download', 'a.mp4');
+    // link.href = href;
+    // document.body.appendChild(link);
+
+    // // wait for the link to be added to the document
+    // var event = new MouseEvent('click');
+    // link.dispatchEvent(event);
+    // document.body.removeChild(link);
+  }
+
+  async function calculateChunkOffsets(file, moovSize, box) {
+    const bs = await read(file, box.offset, box.size);
+    const dv = new DataView(bs);
+    const entryCount = dv.getUint32(HEAD_SIZE + 4);
+
+    const { chunkOffsetSize, getChunkOffset, setChunkOffset } = box.type === 'co64' ?
+          {
+            chunkOffsetSize: 8,
+            getChunkOffset: getUint64,
+            setChunkOffset: setUint64,
+          } : {
+            chunkOffsetSize: 4,
+            getChunkOffset: (dv, offset) => dv.getUint32(offset),
+            setChunkOffset: (dv, offset, value) => dv.setUint32(offset, value),
+          };
+
+    for (let i = 0; i < entryCount; i++) {
+      const offset = HEAD_SIZE + 8 + i * chunkOffsetSize;
+      const chunkOffset = getChunkOffset(dv, offset) + moovSize;
+      setChunkOffset(dv, offset, chunkOffset);
+    }
+
+    return bs;
+  }
+
+  async function parseBox(file, offset, rangeSize, parent) {
+    if (HEAD_SIZE > rangeSize) return undefined;
+
+    const bs = await read(file, offset, HEAD_SIZE);
+    const type = decodeString(bs.slice(4));
+    let size = new DataView(bs).getUint32();
+    if (size === 1) {
+      const bs = await read(file, offset + HEAD_SIZE, 8);
+      size = getUint64(new DataView(bs));
+    }
+
+    const next = await parseBox(file, offset + size, rangeSize - size, parent);
+    const box = { offset, size, type, next, parent };
+
+    if (NESTED_BOX_TYPES_SET.has(type)) {
+      const bodySize = size - HEAD_SIZE;
+      if (bodySize < 0) throw new Error(`box body size is less than 0: ${type} ${size}`);
+      box.firstChild = await parseBox(file, offset + HEAD_SIZE, bodySize, box);
+    }
+
+    return box;
+  }
+
+  async function read(file, offset, len) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+
+      reader.onerror = event => {
+        reject(event);
+      };
+
+      reader.onload = _event => {
+        resolve(reader.result);
+      };
+
+      const blob = file.slice(offset, offset + len);
+      reader.readAsArrayBuffer(blob);
+    });
+  }
+
+  function getUint64(dataview, byteOffset = 0) {
+    // split 64-bit number into two 32-bit (4-byte) parts
+    const left =  dataview.getUint32(byteOffset);
+    const right = dataview.getUint32(byteOffset + 4);
+
+    // combine the two 32-bit values
+    const combined = 2**32*left + right;
+
+    if (!Number.isSafeInteger(combined))
+      throw new Error(`${combined} is not a safe integer`);
+
+    return combined;
+  }
+
+  function setUint64(dataview, byteOffset, value) {
+    if (!Number.isSafeInteger(value))
+      throw new Error(`${value} is not a safe integer`);
+
+    const right = value % (2**32);
+    const left = (value - right) / (2**32);
+
+    dataview.setUint32(byteOffset, left);
+    dataview.setUint32(byteOffset + 4, right);
+  }
+
+  function decodeString(b) {
+    return String.fromCharCode.apply(null, new Uint8Array(b));
+  }
+
+  async function readBytes(file, start, buffer) {
+    if (buffer.length <= 0) return { written: 0, nextStart: start };
+
+    const { box, boxOffset } = start;
+    if (!box) return { written: 0, nextStart: null };
+
+    if (boxOffset === box.size) {
+      return readBytes(file, box.next ? {
+        box: box.next,
+        boxOffset: 0,
+      } : {
+        box: box.parent,
+        boxOffset: (box.parent && box.parent.size) || 0,
+      }, buffer);
+    }
+
+    if (boxOffset === HEAD_SIZE && box.firstChild) {
+      return readBytes(file, {
+        box: box.firstChild,
+        boxOffset: 0,
+      }, buffer);
+    }
+
+    const toCopySize = box.firstChild ? HEAD_SIZE : box.size;
+    const size = Math.min(toCopySize - boxOffset, buffer.length);
+    const bs = new Uint8Array(box.buffer ? box.buffer.slice(boxOffset, boxOffset + size) : await read(file, box.offset + boxOffset, size));
+    buffer.set(bs);
+
+    const { written, nextStart } = await readBytes(file, {
+      box, 
+      boxOffset: boxOffset + size,
+    }, buffer.subarray(size, buffer.length));
+    return { written: written + size, nextStart };
+  }
+
+  function findBoxes(box, predicate, recursive) {
+    if (!box) return [];
+    if (predicate(box))
+      return [box, ...findBoxes(box.next, predicate, recursive)];
+    if (!recursive)
+      return findBoxes(box.next, predicate, recursive);
+    return [
+      ...findBoxes(box.firstChild, predicate, recursive),
+      ...findBoxes(box.next, predicate, recursive),
+    ];
+  }
+
+  function dumpBox(box, indent) {
+    if (!box) return;
+    console.log(indent, box.type, box.offset, box.size);
+    dumpBox(box.firstChild, indent + '  ');
+    dumpBox(box.next, indent);
+  }
+</script>
